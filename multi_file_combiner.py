@@ -34,9 +34,10 @@ if uploaded_zip:
             if not csv_files:
                 st.error("No valid CSV files found in the uploaded ZIP. Note: macOS metadata files are skipped.")
             else:
-                all_data = []  # Store all data as dictionaries to preserve exact values
-                file_info = []  # To store information about each file
+                # Initialize our combined data structure
+                combined_data = {}  # Will store Timestamp as key and dict of meter values as value
                 all_meters = set()  # Track all unique meter names
+                file_info = []  # To store information about each file
                 timestamp_format = "%A, %B %d, %Y %H:%M"  # Thursday, January 02, 2025 02:30
                 
                 # Add a progress bar for processing files
@@ -78,24 +79,21 @@ if uploaded_zip:
                         cols.insert(0, timestamp_col)
                         df = df[cols]
                         
+                        # Get meter columns (all columns except timestamp)
+                        meter_cols = df.columns[1:]
+                        
                         # Parse Timestamp to datetime with the specific format
                         parsed_timestamps = []
                         invalid_timestamps = []
                         
                         for ts in df[timestamp_col]:
                             try:
-                                # Try the specific format first
+                                # Try the specific format
                                 parsed_ts = datetime.strptime(ts, timestamp_format)
                                 parsed_timestamps.append(parsed_ts)
                             except ValueError:
-                                # If the specific format fails, try other common formats
-                                try:
-                                    # Try without zero-padded day
-                                    parsed_ts = datetime.strptime(ts, "%A, %B %d, %Y %H:%M")
-                                    parsed_timestamps.append(parsed_ts)
-                                except ValueError:
-                                    invalid_timestamps.append(ts)
-                                    parsed_timestamps.append(None)
+                                invalid_timestamps.append(ts)
+                                parsed_timestamps.append(None)
                         
                         # Add parsed timestamps to dataframe
                         df['Parsed_Timestamp'] = parsed_timestamps
@@ -113,15 +111,25 @@ if uploaded_zip:
                             continue
                         
                         # Rename meter columns: remove " - Consumption Recorded (MWh)"
-                        new_columns = ['Parsed_Timestamp'] + [col.replace(" - Consumption Recorded (MWh)", "") for col in df.columns[1:-1]]
-                        df.columns = new_columns
+                        # But only if the pattern exists, otherwise keep original names
+                        renamed_meter_cols = []
+                        for col in meter_cols:
+                            if " - Consumption Recorded (MWh)" in col:
+                                renamed_meter_cols.append(col.replace(" - Consumption Recorded (MWh)", ""))
+                            else:
+                                renamed_meter_cols.append(col)
                         
-                        # Store all meter names
-                        meter_cols = list(df.columns[1:])
-                        all_meters.update(meter_cols)
+                        # Create a mapping from old to new column names
+                        col_mapping = {old: new for old, new in zip(meter_cols, renamed_meter_cols)}
+                        
+                        # Update the dataframe with the new column names
+                        df = df.rename(columns=col_mapping)
+                        
+                        # Update our set of all meters
+                        all_meters.update(renamed_meter_cols)
                         
                         # Convert numeric columns to appropriate types, preserving zeros
-                        for col in meter_cols:
+                        for col in renamed_meter_cols:
                             # Convert to numeric, but preserve all values including zeros
                             df[col] = pd.to_numeric(df[col], errors='coerce')
                             # Replace NaN with 0 only if the entire column is numeric
@@ -133,16 +141,21 @@ if uploaded_zip:
                         file_info.append({
                             'filename': os.path.basename(csv_name),
                             'time_range': time_range,
-                            'meters': meter_cols,
+                            'meters': renamed_meter_cols,
                             'rows': len(df)
                         })
                         
-                        # Convert to list of dictionaries to preserve exact values
+                        # Process each row and add to our combined data
                         for _, row in df.iterrows():
-                            record = {'Timestamp': row['Parsed_Timestamp']}
-                            for meter in meter_cols:
-                                record[meter] = row[meter]
-                            all_data.append(record)
+                            timestamp = row['Parsed_Timestamp']
+                            
+                            # If this timestamp doesn't exist in our combined data, create it
+                            if timestamp not in combined_data:
+                                combined_data[timestamp] = {}
+                            
+                            # Add all meter values from this row
+                            for meter in renamed_meter_cols:
+                                combined_data[timestamp][meter] = row[meter]
                         
                     except pd.errors.ParserError as pe:
                         st.warning(f"Parsing error in {csv_name}: {str(pe)}. File may not be a valid CSV. Skipping.")
@@ -151,27 +164,30 @@ if uploaded_zip:
                         import traceback
                         st.write(traceback.format_exc())
                 
-                if not all_data:
+                if not combined_data:
                     st.error("No valid CSV files processed.")
                 else:
                     status_text.text("Combining data from all files...")
                     
-                    # Create final dataframe with all meters as columns
-                    combined_df = pd.DataFrame(all_data)
+                    # Convert our combined data to a DataFrame
+                    # First, create a list of all timestamps
+                    all_timestamps = sorted(combined_data.keys())
                     
-                    # Ensure all meter columns are present (fill with 0 if missing from some files)
+                    # Create a DataFrame with all timestamps as index
+                    combined_df = pd.DataFrame(index=all_timestamps)
+                    
+                    # Add all meters as columns, filling with appropriate values
                     for meter in all_meters:
-                        if meter not in combined_df.columns:
-                            combined_df[meter] = 0
+                        combined_df[meter] = 0.0  # Initialize with zeros
+                        
+                        # Fill in the actual values where they exist
+                        for timestamp in all_timestamps:
+                            if meter in combined_data[timestamp]:
+                                combined_df.at[timestamp, meter] = combined_data[timestamp][meter]
                     
-                    # Sort by timestamp
-                    combined_df = combined_df.sort_values(by='Timestamp')
-                    
-                    # Check for duplicate timestamps
-                    duplicate_count = combined_df.duplicated(subset=['Timestamp']).sum()
-                    if duplicate_count > 0:
-                        st.warning(f"Found {duplicate_count} duplicate timestamps. Keeping all values.")
-                        # For duplicate timestamps, we'll keep all rows but show a warning
+                    # Reset index to make Timestamp a column
+                    combined_df.reset_index(inplace=True)
+                    combined_df.rename(columns={'index': 'Timestamp'}, inplace=True)
                     
                     # Display file information
                     st.subheader("Processed Files Summary")
