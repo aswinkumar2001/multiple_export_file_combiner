@@ -5,6 +5,7 @@ from datetime import datetime
 import zipfile
 from io import BytesIO
 import os
+import numpy as np
 
 # Set page configuration
 st.set_page_config(page_title="ZIP File Combiner", layout="wide")
@@ -36,6 +37,7 @@ if uploaded_zip:
                 all_data = []  # Store all data as dictionaries to preserve exact values
                 file_info = []  # To store information about each file
                 all_meters = set()  # Track all unique meter names
+                timestamp_format = "%A, %B %d, %Y %H:%M"  # Thursday, January 02, 2025 02:30
                 
                 # Add a progress bar for processing files
                 progress_bar = st.progress(0)
@@ -50,7 +52,8 @@ if uploaded_zip:
                         for encoding in ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']:
                             try:
                                 with zip_ref.open(csv_name) as csv_file:
-                                    df = pd.read_csv(csv_file, encoding=encoding)
+                                    # Read without parsing dates to preserve exact values
+                                    df = pd.read_csv(csv_file, encoding=encoding, dtype=str)
                                 break
                             except UnicodeDecodeError:
                                 continue
@@ -75,50 +78,58 @@ if uploaded_zip:
                         cols.insert(0, timestamp_col)
                         df = df[cols]
                         
-                        # Parse Timestamp to datetime with multiple format support
-                        def parse_timestamp(ts):
-                            if pd.isna(ts):
-                                return None
-                                
-                            ts_str = str(ts).strip()
-                            formats = [
-                                "%A, %B %d, %Y %H:%M",  # Original format: Monday, January 01, 2024 00:00
-                                "%Y-%m-%d %H:%M:%S",     # ISO format
-                                "%m/%d/%Y %H:%M",        # US format
-                                "%d/%m/%Y %H:%M",        # European format
-                                "%Y-%m-%d %H:%M",        # ISO without seconds
-                                "%d-%m-%Y %H:%M",        # Another common format
-                            ]
-                            
-                            for fmt in formats:
-                                try:
-                                    return datetime.strptime(ts_str, fmt)
-                                except ValueError:
-                                    continue
-                            return None
+                        # Parse Timestamp to datetime with the specific format
+                        parsed_timestamps = []
+                        invalid_timestamps = []
                         
-                        df[timestamp_col] = df[timestamp_col].apply(parse_timestamp)
+                        for ts in df[timestamp_col]:
+                            try:
+                                # Try the specific format first
+                                parsed_ts = datetime.strptime(ts, timestamp_format)
+                                parsed_timestamps.append(parsed_ts)
+                            except ValueError:
+                                # If the specific format fails, try other common formats
+                                try:
+                                    # Try without zero-padded day
+                                    parsed_ts = datetime.strptime(ts, "%A, %B %d, %Y %H:%M")
+                                    parsed_timestamps.append(parsed_ts)
+                                except ValueError:
+                                    invalid_timestamps.append(ts)
+                                    parsed_timestamps.append(None)
+                        
+                        # Add parsed timestamps to dataframe
+                        df['Parsed_Timestamp'] = parsed_timestamps
                         
                         # Drop rows with invalid timestamps
                         initial_count = len(df)
-                        df = df.dropna(subset=[timestamp_col])
+                        df = df[df['Parsed_Timestamp'].notna()]
                         if len(df) < initial_count:
-                            st.info(f"File {csv_name}: Dropped {initial_count - len(df)} rows with invalid timestamps.")
+                            st.warning(f"File {csv_name}: Dropped {initial_count - len(df)} rows with invalid timestamps.")
+                            if invalid_timestamps:
+                                st.write(f"Invalid timestamp examples: {invalid_timestamps[:3]}")
                         
                         if df.empty:
                             st.warning(f"File {csv_name} has no valid timestamps. Skipping.")
                             continue
                         
                         # Rename meter columns: remove " - Consumption Recorded (MWh)"
-                        new_columns = [timestamp_col] + [col.replace(" - Consumption Recorded (MWh)", "") for col in df.columns[1:]]
+                        new_columns = ['Parsed_Timestamp'] + [col.replace(" - Consumption Recorded (MWh)", "") for col in df.columns[1:-1]]
                         df.columns = new_columns
                         
                         # Store all meter names
                         meter_cols = list(df.columns[1:])
                         all_meters.update(meter_cols)
                         
+                        # Convert numeric columns to appropriate types, preserving zeros
+                        for col in meter_cols:
+                            # Convert to numeric, but preserve all values including zeros
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                            # Replace NaN with 0 only if the entire column is numeric
+                            if df[col].dtype in [np.float64, np.int64]:
+                                df[col] = df[col].fillna(0)
+                        
                         # Store file information
-                        time_range = f"{df[timestamp_col].min().strftime('%Y-%m-%d')} to {df[timestamp_col].max().strftime('%Y-%m-%d')}"
+                        time_range = f"{df['Parsed_Timestamp'].min().strftime('%Y-%m-%d')} to {df['Parsed_Timestamp'].max().strftime('%Y-%m-%d')}"
                         file_info.append({
                             'filename': os.path.basename(csv_name),
                             'time_range': time_range,
@@ -128,7 +139,7 @@ if uploaded_zip:
                         
                         # Convert to list of dictionaries to preserve exact values
                         for _, row in df.iterrows():
-                            record = {'Timestamp': row[timestamp_col]}
+                            record = {'Timestamp': row['Parsed_Timestamp']}
                             for meter in meter_cols:
                                 record[meter] = row[meter]
                             all_data.append(record)
@@ -137,6 +148,8 @@ if uploaded_zip:
                         st.warning(f"Parsing error in {csv_name}: {str(pe)}. File may not be a valid CSV. Skipping.")
                     except Exception as e:
                         st.warning(f"Error processing {csv_name}: {str(e)}. Skipping.")
+                        import traceback
+                        st.write(traceback.format_exc())
                 
                 if not all_data:
                     st.error("No valid CSV files processed.")
@@ -146,20 +159,19 @@ if uploaded_zip:
                     # Create final dataframe with all meters as columns
                     combined_df = pd.DataFrame(all_data)
                     
-                    # Ensure all meter columns are present (fill with NaN if missing from some files)
+                    # Ensure all meter columns are present (fill with 0 if missing from some files)
                     for meter in all_meters:
                         if meter not in combined_df.columns:
-                            combined_df[meter] = None
+                            combined_df[meter] = 0
                     
                     # Sort by timestamp
                     combined_df = combined_df.sort_values(by='Timestamp')
                     
-                    # Remove duplicate timestamps (keep last occurrence)
-                    combined_df = combined_df.drop_duplicates(subset=['Timestamp'], keep='last')
-                    
-                    # Replace NaN values with 0 (as requested)
-                    meter_columns = [col for col in combined_df.columns if col != 'Timestamp']
-                    combined_df[meter_columns] = combined_df[meter_columns].fillna(0)
+                    # Check for duplicate timestamps
+                    duplicate_count = combined_df.duplicated(subset=['Timestamp']).sum()
+                    if duplicate_count > 0:
+                        st.warning(f"Found {duplicate_count} duplicate timestamps. Keeping all values.")
+                        # For duplicate timestamps, we'll keep all rows but show a warning
                     
                     # Display file information
                     st.subheader("Processed Files Summary")
@@ -178,8 +190,12 @@ if uploaded_zip:
                         st.metric("Total Rows", len(combined_df))
                     
                     # Display preview
-                    st.subheader("Preview of Combined Data")
-                    st.dataframe(combined_df.head(10))  # Show first 10 rows
+                    st.subheader("Preview of Combined Data (First 10 Rows)")
+                    st.dataframe(combined_df.head(10))
+                    
+                    # Display last few rows to verify data integrity
+                    st.subheader("End of Combined Data (Last 10 Rows)")
+                    st.dataframe(combined_df.tail(10))
                     
                     # Show data completeness
                     st.subheader("Data Completeness by Meter")
@@ -187,13 +203,21 @@ if uploaded_zip:
                     for col in combined_df.columns[1:]:  # Skip Timestamp column
                         completeness[col] = {
                             'Total Values': len(combined_df),
-                            'Non-Zero Values': (combined_df[col] != 0).sum(),
                             'Zero Values': (combined_df[col] == 0).sum(),
+                            'Non-Zero Values': (combined_df[col] != 0).sum(),
                             'Non-Zero %': round((combined_df[col] != 0).sum() / len(combined_df) * 100, 2)
                         }
                     
                     completeness_df = pd.DataFrame(completeness).T
                     st.dataframe(completeness_df)
+                    
+                    # Show timestamp frequency analysis
+                    st.subheader("Timestamp Frequency Analysis")
+                    time_diffs = combined_df['Timestamp'].diff().dropna()
+                    if not time_diffs.empty:
+                        most_common_diff = time_diffs.mode().iloc[0] if not time_diffs.mode().empty else None
+                        st.write(f"Most common time interval: {most_common_diff}")
+                        st.write(f"Time range: {combined_df['Timestamp'].min()} to {combined_df['Timestamp'].max()}")
                     
                     # Function to convert DataFrame to Excel
                     def to_excel(df):
@@ -245,5 +269,7 @@ if uploaded_zip:
         st.error("The uploaded file is not a valid ZIP file.")
     except Exception as e:
         st.error(f"An unexpected error occurred: {str(e)}")
+        import traceback
+        st.write(traceback.format_exc())
 else:
     st.info("Please upload a ZIP file containing CSV files.")
