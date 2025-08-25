@@ -4,6 +4,7 @@ import io
 from datetime import datetime
 import zipfile
 from io import BytesIO
+import os
 
 # Set page configuration
 st.title("ZIP File Combiner for CSV Files")
@@ -17,18 +18,23 @@ if uploaded_zip:
         # Read the ZIP file
         zip_content = BytesIO(uploaded_zip.read())
         with zipfile.ZipFile(zip_content, 'r') as zip_ref:
-            # Get list of CSV files in ZIP
-            csv_files = [f for f in zip_ref.namelist() if f.lower().endswith('.csv')]
+            # Get list of CSV files in ZIP, skipping macOS metadata files
+            csv_files = [
+                f for f in zip_ref.namelist()
+                if f.lower().endswith('.csv')
+                and 'MACOSX' not in f.upper()
+                and not os.path.basename(f).startswith('.')
+            ]
             
             if not csv_files:
-                st.error("No CSV files found in the uploaded ZIP.")
+                st.error("No valid CSV files found in the uploaded ZIP. Note: macOS metadata files are skipped.")
             else:
                 dfs = []
                 for csv_name in csv_files:
                     try:
-                        # Read CSV from ZIP
+                        # Read CSV from ZIP with latin1 encoding to handle special characters
                         with zip_ref.open(csv_name) as csv_file:
-                            df = pd.read_csv(csv_file)
+                            df = pd.read_csv(csv_file, encoding='latin1')
                         
                         # Ensure 'Timestamp' is the first column
                         if df.columns[0] != 'Timestamp':
@@ -59,6 +65,10 @@ if uploaded_zip:
                         df = df.set_index('Timestamp')
                         
                         dfs.append(df)
+                    except UnicodeDecodeError as ude:
+                        st.warning(f"Encoding error in {csv_name}: {str(ude)}. Try checking file encoding. Skipping.")
+                    except pd.errors.ParserError as pe:
+                        st.warning(f"Parsing error in {csv_name}: {str(pe)}. File may not be a valid CSV. Skipping.")
                     except Exception as e:
                         st.warning(f"Error processing {csv_name}: {str(e)}. Skipping.")
                 
@@ -68,15 +78,8 @@ if uploaded_zip:
                     # Concatenate all DataFrames on columns (axis=1), aligning on Timestamp index
                     combined_df = pd.concat(dfs, axis=1)
                     
-                    # Handle duplicate columns by keeping the first occurrence or merging as needed
-                    # For now, pandas concat will append suffixes if duplicates, but assuming meters are unique across files
-                    # If not, we can group or something, but for simplicity, assume unique
-                    
                     # Reset index to bring Timestamp back as column
                     combined_df = combined_df.reset_index()
-                    
-                    # Drop duplicate Timestamp if any, but since it's index, shouldn't be
-                    # Fill NaNs if misaligned timestamps
                     
                     # Display preview
                     st.write("Preview of Combined Data:")
