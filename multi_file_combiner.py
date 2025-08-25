@@ -33,8 +33,9 @@ if uploaded_zip:
             if not csv_files:
                 st.error("No valid CSV files found in the uploaded ZIP. Note: macOS metadata files are skipped.")
             else:
-                all_dfs = []  # Store all dataframes
+                all_data = []  # Store all data as dictionaries to preserve exact values
                 file_info = []  # To store information about each file
+                all_meters = set()  # Track all unique meter names
                 
                 # Add a progress bar for processing files
                 progress_bar = st.progress(0)
@@ -112,39 +113,53 @@ if uploaded_zip:
                         new_columns = [timestamp_col] + [col.replace(" - Consumption Recorded (MWh)", "") for col in df.columns[1:]]
                         df.columns = new_columns
                         
+                        # Store all meter names
+                        meter_cols = list(df.columns[1:])
+                        all_meters.update(meter_cols)
+                        
                         # Store file information
                         time_range = f"{df[timestamp_col].min().strftime('%Y-%m-%d')} to {df[timestamp_col].max().strftime('%Y-%m-%d')}"
                         file_info.append({
                             'filename': os.path.basename(csv_name),
                             'time_range': time_range,
-                            'meters': list(df.columns[1:]),
+                            'meters': meter_cols,
                             'rows': len(df)
                         })
                         
-                        all_dfs.append(df)
+                        # Convert to list of dictionaries to preserve exact values
+                        for _, row in df.iterrows():
+                            record = {'Timestamp': row[timestamp_col]}
+                            for meter in meter_cols:
+                                record[meter] = row[meter]
+                            all_data.append(record)
                         
                     except pd.errors.ParserError as pe:
                         st.warning(f"Parsing error in {csv_name}: {str(pe)}. File may not be a valid CSV. Skipping.")
                     except Exception as e:
                         st.warning(f"Error processing {csv_name}: {str(e)}. Skipping.")
                 
-                if not all_dfs:
+                if not all_data:
                     st.error("No valid CSV files processed.")
                 else:
                     status_text.text("Combining data from all files...")
                     
-                    # Combine all DataFrames along the time axis (vertically)
-                    # This will stack data from different time periods
-                    combined_df = pd.concat(all_dfs, axis=0, ignore_index=True)
+                    # Create final dataframe with all meters as columns
+                    combined_df = pd.DataFrame(all_data)
+                    
+                    # Ensure all meter columns are present (fill with NaN if missing from some files)
+                    for meter in all_meters:
+                        if meter not in combined_df.columns:
+                            combined_df[meter] = None
                     
                     # Sort by timestamp
-                    combined_df = combined_df.sort_values(by=timestamp_col)
+                    combined_df = combined_df.sort_values(by='Timestamp')
                     
                     # Remove duplicate timestamps (keep last occurrence)
-                    combined_df = combined_df.drop_duplicates(subset=[timestamp_col], keep='last')
+                    combined_df = combined_df.drop_duplicates(subset=['Timestamp'], keep='last')
                     
-                    # Rename timestamp column to standard name
-                    combined_df.rename(columns={timestamp_col: 'Timestamp'}, inplace=True)
+                    # Replace NaN values with 0 (as requested)
+                    meter_columns = [col for col in combined_df.columns if col != 'Timestamp']
+                    combined_df[meter_columns] = combined_df[meter_columns].fillna(0)
                     
                     # Display file information
                     st.subheader("Processed Files Summary")
@@ -172,8 +187,9 @@ if uploaded_zip:
                     for col in combined_df.columns[1:]:  # Skip Timestamp column
                         completeness[col] = {
                             'Total Values': len(combined_df),
-                            'Non-Null Values': combined_df[col].notna().sum(),
-                            'Completeness %': round(combined_df[col].notna().sum() / len(combined_df) * 100, 2)
+                            'Non-Zero Values': (combined_df[col] != 0).sum(),
+                            'Zero Values': (combined_df[col] == 0).sum(),
+                            'Non-Zero %': round((combined_df[col] != 0).sum() / len(combined_df) * 100, 2)
                         }
                     
                     completeness_df = pd.DataFrame(completeness).T
