@@ -5,7 +5,6 @@ from datetime import datetime
 import zipfile
 from io import BytesIO
 import os
-import numpy as np
 
 # Set page configuration
 st.set_page_config(page_title="ZIP File Combiner", layout="wide")
@@ -34,7 +33,7 @@ if uploaded_zip:
             if not csv_files:
                 st.error("No valid CSV files found in the uploaded ZIP. Note: macOS metadata files are skipped.")
             else:
-                dfs = []
+                all_dfs = []  # Store all dataframes
                 file_info = []  # To store information about each file
                 
                 # Add a progress bar for processing files
@@ -113,64 +112,39 @@ if uploaded_zip:
                         new_columns = [timestamp_col] + [col.replace(" - Consumption Recorded (MWh)", "") for col in df.columns[1:]]
                         df.columns = new_columns
                         
-                        # Set index to Timestamp
-                        df = df.set_index(timestamp_col)
-                        
-                        # Sort by timestamp
-                        df = df.sort_index()
-                        
                         # Store file information
-                        time_range = f"{df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}"
+                        time_range = f"{df[timestamp_col].min().strftime('%Y-%m-%d')} to {df[timestamp_col].max().strftime('%Y-%m-%d')}"
                         file_info.append({
                             'filename': os.path.basename(csv_name),
                             'time_range': time_range,
-                            'meters': list(df.columns),
+                            'meters': list(df.columns[1:]),
                             'rows': len(df)
                         })
                         
-                        dfs.append(df)
+                        all_dfs.append(df)
                         
                     except pd.errors.ParserError as pe:
                         st.warning(f"Parsing error in {csv_name}: {str(pe)}. File may not be a valid CSV. Skipping.")
                     except Exception as e:
                         st.warning(f"Error processing {csv_name}: {str(e)}. Skipping.")
                 
-                if not dfs:
+                if not all_dfs:
                     st.error("No valid CSV files processed.")
                 else:
                     status_text.text("Combining data from all files...")
                     
                     # Combine all DataFrames along the time axis (vertically)
-                    # First, ensure all DataFrames have the same column names
-                    all_columns = set()
-                    for df in dfs:
-                        all_columns.update(df.columns)
-                    
-                    all_columns = sorted(list(all_columns))
-                    
-                    # Reindex each DataFrame to have all columns
-                    reindexed_dfs = []
-                    for df in dfs:
-                        # Add missing columns with NaN values
-                        for col in all_columns:
-                            if col not in df.columns:
-                                df[col] = np.nan
-                        # Reorder columns to match the master list
-                        df = df[all_columns]
-                        reindexed_dfs.append(df)
-                    
-                    # Concatenate along the time axis (vertically)
-                    combined_df = pd.concat(reindexed_dfs, axis=0)
+                    # This will stack data from different time periods
+                    combined_df = pd.concat(all_dfs, axis=0, ignore_index=True)
                     
                     # Sort by timestamp
-                    combined_df = combined_df.sort_index()
+                    combined_df = combined_df.sort_values(by=timestamp_col)
                     
                     # Remove duplicate timestamps (keep last occurrence)
-                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                    combined_df = combined_df.drop_duplicates(subset=[timestamp_col], keep='last')
                     
-                    # Reset index to bring Timestamp back as column
-                    combined_df = combined_df.reset_index()
-                    combined_df.rename(columns={'index': 'Timestamp'}, inplace=True)
+                    # Rename timestamp column to standard name
+                    combined_df.rename(columns={timestamp_col: 'Timestamp'}, inplace=True)
                     
                     # Display file information
                     st.subheader("Processed Files Summary")
